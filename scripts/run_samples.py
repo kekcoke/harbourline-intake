@@ -22,7 +22,9 @@ sys.path.insert(0, str(ROOT))
 from src.intake import (  # noqa: E402
     MAX_MODEL_CALLS,
     Config,
+    CallModel,
     IntakeTrace,
+    Prompt,
     ProviderError,
     load_prompt,
     make_caller,
@@ -88,28 +90,29 @@ def _token_records(run_id: str, email_path: Path, cfg: Config, trace: IntakeTrac
     ]
 
 
-def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s", stream=sys.stderr)
+def _rel(path: Path) -> str:
+    try:
+        return path.relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(path)
 
-    email_paths = sorted(EMAILS_DIR.glob("*.txt"))
-    if not email_paths:
-        print(f"No sample emails found in {EMAILS_DIR}", file=sys.stderr)
-        return 1
 
-    try:  # fail fast on a bad MODEL_NAME, a missing API key or a missing SDK
-        cfg = Config.from_env()
-        prompt = load_prompt()
-        call_model = make_caller(cfg)
-    except (ProviderError, ValueError, ImportError) as exc:
-        print(f"configuration error: {exc}", file=sys.stderr)
-        return 2
+def run_suite(
+    email_paths: list[Path],
+    runs_dir: Path,
+    cfg: Config,
+    prompt: Prompt,
+    call_model: CallModel,
+    run_id: str,
+) -> list[dict]:
+    """Process each email and write all artifacts into ``runs_dir``. Returns the per-email records.
 
-    _clear_previous_outputs()
-    run_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    print(f"run {run_id}: {len(email_paths)} email(s), model={cfg.model_name} ({cfg.provider})", file=sys.stderr)
-
+    Writes <stem>.json / <stem>.failed.json, run_log.jsonl, tokens.jsonl and summary.json.
+    The provider (``call_model``) and output directory are injectable for offline tests.
+    """
+    runs_dir.mkdir(parents=True, exist_ok=True)
     records = []
-    with RUN_LOG.open("w", encoding="utf-8") as log_file, TOKENS_LOG.open("w", encoding="utf-8") as tokens_file:
+    with (runs_dir / RUN_LOG.name).open("w", encoding="utf-8") as log_file, (runs_dir / TOKENS_LOG.name).open("w", encoding="utf-8") as tokens_file:
         for email_path in email_paths:
             email = email_path.read_text(encoding="utf-8")
             trace = run_with_trace(email, call_model=call_model, prompt=prompt, max_tokens=cfg.max_tokens)
@@ -123,7 +126,7 @@ def main() -> int:
 
             if trace.intake is not None:
                 out = trace.intake.model_dump(mode="json")
-                (RUNS_DIR / f"{email_path.stem}.json").write_text(
+                (runs_dir / f"{email_path.stem}.json").write_text(
                     json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
                 )
                 print(json.dumps(out, ensure_ascii=False))
@@ -147,7 +150,7 @@ def main() -> int:
                         for a in trace.attempts
                     ],
                 }
-                (RUNS_DIR / f"{email_path.stem}.failed.json").write_text(
+                (runs_dir / f"{email_path.stem}.failed.json").write_text(
                     json.dumps(failure, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
                 )
                 status = "FAILED"
@@ -163,7 +166,7 @@ def main() -> int:
         "run_id": run_id,
         **cfg.as_log_dict(),
         "max_attempts": MAX_MODEL_CALLS,
-        "prompt_file": prompt.path.relative_to(ROOT).as_posix(),
+        "prompt_file": _rel(prompt.path),
         "prompt_sha256": prompt.sha256,
         "emails": len(records),
         "valid": valid,
@@ -176,8 +179,33 @@ def main() -> int:
         "run_log_file": RUN_LOG.name,
         "tokens_file": TOKENS_LOG.name,
     }
-    SUMMARY.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"done: {valid}/{len(records)} valid → {RUNS_DIR}/", file=sys.stderr)
+    (runs_dir / SUMMARY.name).write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"done: {valid}/{len(records)} valid → {runs_dir}/", file=sys.stderr)
+    return records
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s", stream=sys.stderr)
+
+    email_paths = sorted(EMAILS_DIR.glob("*.txt"))
+    if not email_paths:
+        print(f"No sample emails found in {EMAILS_DIR}", file=sys.stderr)
+        return 1
+
+    try:  # fail fast on a bad MODEL_NAME, a missing API key or a missing SDK
+        cfg = Config.from_env()
+        prompt = load_prompt()
+        call_model = make_caller(cfg)
+    except (ProviderError, ValueError, ImportError) as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    _clear_previous_outputs()
+    run_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"run {run_id}: {len(email_paths)} email(s), model={cfg.model_name} ({cfg.provider})", file=sys.stderr)
+
+    records = run_suite(email_paths, RUNS_DIR, cfg, prompt, call_model, run_id)
+    valid = sum(r["outcome"] == "valid" for r in records)
     return 0 if valid == len(records) else 1
 
 

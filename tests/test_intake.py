@@ -5,17 +5,22 @@ Run from the repo root:  python -m unittest
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import logging
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import scripts.run_samples as run_samples  # noqa: E402
 from src.intake import (  # noqa: E402
     MAX_EMAIL_CHARS,
+    Config,
     MAX_MODEL_CALLS,
     Intake,
     IntakeValidationError,
@@ -237,6 +242,114 @@ class TruncationHintTests(unittest.TestCase):
         fake = FakeModel(["not json", dumps()], stop_reason="stop")
         trace = run_with_trace("email", call_model=fake, prompt=self.prompt, max_tokens=256)
         self.assertNotIn("cut off", trace.attempts[0].validation_error)
+
+
+# Scripted replies per email for the runner log tests. Each list has one more reply than
+# the loop may use, so consuming it would prove the 3-call ceiling was exceeded.
+CASE_A_REPLIES = ["not json", dumps(), "UNUSED-4th"]
+CASE_B_REPLIES = [
+    "not json",
+    "```json\n" + dumps() + "\n```",
+    dumps(confidence=5),
+    "UNUSED-4th",
+]
+
+
+class ScriptedByEmail:
+    """Fake provider that picks a FakeModel based on which test email is being processed."""
+
+    def __init__(self, scripts: dict[str, list[str]]):
+        self.models = {marker: FakeModel(replies) for marker, replies in scripts.items()}
+
+    def __call__(self, system, messages):
+        first_user = messages[0]["content"]
+        for marker, model in self.models.items():
+            if marker in first_user:
+                return model(system, messages)
+        raise AssertionError("unscripted email")
+
+
+class RunnerLogTests(unittest.TestCase):
+    """Case A (recover on attempt 2) and Case B (3 failures) through the real runner + log writers."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()  # removed in tearDown
+        root = Path(self.tmp.name)
+        emails = root / "emails"
+        emails.mkdir()
+        (emails / "a_recovers.txt").write_text("CASE-A: what does my plan cover?", encoding="utf-8")
+        (emails / "b_exhausts.txt").write_text("CASE-B: billing question", encoding="utf-8")
+        self.runs = root / "runs"
+        self.fake = ScriptedByEmail({"CASE-A": CASE_A_REPLIES, "CASE-B": CASE_B_REPLIES})
+        cfg = Config(model_name="deepseek-flash", max_tokens=2048, temperature=0.0, effort="low",
+                     deepseek_base_url="https://api.deepseek.com")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.records = run_samples.run_suite(
+                sorted(emails.glob("*.txt")), self.runs, cfg, load_prompt(), self.fake, "test-run"
+            )
+        self.log = {r["email_file"]: r for r in map(json.loads, (self.runs / "run_log.jsonl").read_text().splitlines())}
+        self.tokens = [json.loads(l) for l in (self.runs / "tokens.jsonl").read_text().splitlines()]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def assertRetriesCarryErrors(self, model: FakeModel, record: dict):
+        attempts = record["attempt_log"]
+        for i, call in enumerate(model.calls[1:], start=1):
+            prev = attempts[i - 1]
+            self.assertEqual(call[-2], {"role": "assistant", "content": prev["raw_response"]})
+            self.assertIn(prev["validation_error"], call[-1]["content"])
+            self.assertEqual(call[-1]["role"], "user")
+
+    def assertTotals(self, record: dict):
+        for key in ("input_tokens", "output_tokens", "latency_ms"):
+            self.assertEqual(record[key], sum(a[key] for a in record["attempt_log"]))
+            self.assertGreater(record[key], 0)
+
+    def test_case_a_recovers_on_attempt_2(self):
+        model = self.fake.models["CASE-A"]
+        rec = self.log["a_recovers.txt"]
+        self.assertEqual(len(model.calls), 2)
+        self.assertEqual(model.outputs, ["UNUSED-4th"])
+        self.assertEqual((rec["outcome"], rec["stop_reason"], rec["attempts"]), ("valid", "valid_schema", 2))
+        self.assertEqual(len(rec["validation_errors"]), 1)
+        self.assertIn("json_invalid", rec["validation_errors"][0])
+        self.assertEqual(rec["attempt_log"][0]["raw_response"], "not json")
+        self.assertIsNone(rec["attempt_log"][1]["raw_response"])
+        self.assertTrue(rec["attempt_log"][1]["valid"])
+        self.assertRetriesCarryErrors(model, rec)
+        self.assertTotals(rec)
+        validate_intake((self.runs / "a_recovers.json").read_text())
+        self.assertFalse((self.runs / "a_recovers.failed.json").exists())
+
+    def test_case_b_hits_three_call_ceiling(self):
+        model = self.fake.models["CASE-B"]
+        rec = self.log["b_exhausts.txt"]
+        self.assertEqual(len(model.calls), MAX_MODEL_CALLS)
+        self.assertEqual(model.outputs, ["UNUSED-4th"])
+        self.assertEqual((rec["outcome"], rec["stop_reason"], rec["attempts"]), ("failed", "max_attempts_reached", 3))
+        self.assertEqual(len(rec["validation_errors"]), 3)
+        self.assertEqual([a["raw_response"] for a in rec["attempt_log"]], CASE_B_REPLIES[:3])
+        self.assertIn("less_than_equal", rec["validation_errors"][2])
+        self.assertRetriesCarryErrors(model, rec)
+        self.assertTotals(rec)
+        failed = json.loads((self.runs / "b_exhausts.failed.json").read_text())
+        self.assertEqual(failed["stop_reason"], "max_attempts_reached")
+        self.assertEqual([a["raw_response"] for a in failed["attempts"]], CASE_B_REPLIES[:3])
+        self.assertTrue(all(a["validation_error"] for a in failed["attempts"]))
+        self.assertFalse((self.runs / "b_exhausts.json").exists())
+
+    def test_tokens_jsonl_and_summary(self):
+        self.assertEqual(len(self.tokens), 5)
+        self.assertEqual([(t["email_file"], t["attempt"], t["error_type"]) for t in self.tokens], [
+            ("a_recovers.txt", 1, "validation"), ("a_recovers.txt", 2, None),
+            ("b_exhausts.txt", 1, "validation"), ("b_exhausts.txt", 2, "validation"), ("b_exhausts.txt", 3, "validation"),
+        ])
+        for t in self.tokens:
+            self.assertGreater(t["input_tokens"], 0)
+            self.assertGreater(t["latency_ms"], 0)
+        summary = json.loads((self.runs / "summary.json").read_text())
+        self.assertEqual((summary["valid"], summary["failed"], summary["total_model_calls"]), (1, 1, 5))
 
 
 class PromptAndConfigTests(unittest.TestCase):
