@@ -2,8 +2,9 @@
 
 stdout: one schema-valid Intake JSON object per successfully processed email (one per line).
 stderr: progress and failure summaries.
-runs/week-1/: per-email Intake JSON, <stem>.failed.json for failures, run_log.jsonl, summary.json.
-Exit code: 0 if every email produced a valid Intake, 1 otherwise.
+runs/week-1/: per-email Intake JSON, <stem>.failed.json for failures, run_log.jsonl (one line per
+email), tokens.jsonl (one line per model call), summary.json.
+Exit code: 0 if every email produced a valid Intake, 1 if any failed, 2 on a configuration error.
 """
 
 from __future__ import annotations
@@ -31,13 +32,14 @@ from src.intake import (  # noqa: E402
 EMAILS_DIR = ROOT / "data" / "emails"
 RUNS_DIR = ROOT / "runs" / "week-1"
 RUN_LOG = RUNS_DIR / "run_log.jsonl"
+TOKENS_LOG = RUNS_DIR / "tokens.jsonl"
 SUMMARY = RUNS_DIR / "summary.json"
 
 
 def _clear_previous_outputs() -> None:
     """Remove only the files this script writes, so stale results never linger."""
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    for path in [*RUNS_DIR.glob("*.json"), RUN_LOG]:
+    for path in [*RUNS_DIR.glob("*.json"), RUN_LOG, TOKENS_LOG]:
         if path.is_file():
             path.unlink()
 
@@ -55,12 +57,35 @@ def _log_record(run_id: str, email_path: Path, cfg: Config, trace: IntakeTrace) 
         "input_tokens": trace.input_tokens,
         "output_tokens": trace.output_tokens,
         "latency_ms": trace.latency_ms,
+        "input_error": trace.input_error,
         "validation_errors": [a.validation_error for a in trace.attempts if a.validation_error],
         "provider_errors": [a.provider_error for a in trace.attempts if a.provider_error],
         "prompt_file": trace.prompt_file,
         "prompt_sha256": trace.prompt_sha256,
         "attempt_log": [asdict(a) for a in trace.attempts],
     }
+
+
+def _token_records(run_id: str, email_path: Path, cfg: Config, trace: IntakeTrace) -> list[dict]:
+    """One flat record per model call, including calls that ended in a provider error."""
+    return [
+        {
+            "run_id": run_id,
+            "email_file": email_path.name,
+            "attempt": a.attempt,
+            "provider": cfg.provider,
+            "model": cfg.model_name,
+            "served_model": a.served_model,
+            "input_tokens": a.input_tokens,
+            "output_tokens": a.output_tokens,
+            "latency_ms": a.latency_ms,
+            "api_stop_reason": a.api_stop_reason,
+            "request_id": a.request_id,
+            "valid": a.valid,
+            "error_type": "provider" if a.provider_error else "validation" if a.validation_error else None,
+        }
+        for a in trace.attempts
+    ]
 
 
 def main() -> int:
@@ -84,14 +109,17 @@ def main() -> int:
     print(f"run {run_id}: {len(email_paths)} email(s), model={cfg.model_name} ({cfg.provider})", file=sys.stderr)
 
     records = []
-    with RUN_LOG.open("w", encoding="utf-8") as log_file:
+    with RUN_LOG.open("w", encoding="utf-8") as log_file, TOKENS_LOG.open("w", encoding="utf-8") as tokens_file:
         for email_path in email_paths:
             email = email_path.read_text(encoding="utf-8")
-            trace = run_with_trace(email, call_model=call_model, prompt=prompt)
+            trace = run_with_trace(email, call_model=call_model, prompt=prompt, max_tokens=cfg.max_tokens)
             record = _log_record(run_id, email_path, cfg, trace)
             records.append(record)
             log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
             log_file.flush()
+            for token_record in _token_records(run_id, email_path, cfg, trace):
+                tokens_file.write(json.dumps(token_record, ensure_ascii=False) + "\n")
+            tokens_file.flush()
 
             if trace.intake is not None:
                 out = trace.intake.model_dump(mode="json")
@@ -105,6 +133,7 @@ def main() -> int:
                     "email_file": email_path.name,
                     "outcome": "failed",
                     "stop_reason": trace.stop_reason,
+                    "input_error": trace.input_error,
                     "attempts": [
                         {
                             "attempt": a.attempt,
@@ -113,6 +142,7 @@ def main() -> int:
                             "provider_error": a.provider_error,
                             "api_stop_reason": a.api_stop_reason,
                             "request_id": a.request_id,
+                            "served_model": a.served_model,
                         }
                         for a in trace.attempts
                     ],
@@ -143,6 +173,8 @@ def main() -> int:
         "total_output_tokens": sum(r["output_tokens"] for r in records),
         "total_latency_ms": sum(r["latency_ms"] for r in records),
         "stop_reasons": {r["email_file"]: r["stop_reason"] for r in records},
+        "run_log_file": RUN_LOG.name,
+        "tokens_file": TOKENS_LOG.name,
     }
     SUMMARY.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"done: {valid}/{len(records)} valid → {RUNS_DIR}/", file=sys.stderr)

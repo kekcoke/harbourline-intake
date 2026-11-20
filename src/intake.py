@@ -41,7 +41,13 @@ PROMPT_PATH = ROOT / "prompts" / "intake_v1.md"
 # Hard bound on model calls per email. Deliberately a constant, not an env var.
 MAX_MODEL_CALLS = 3
 
-StopReason = Literal["valid_schema", "max_attempts_reached", "provider_error"]
+# Input guard: emails that are empty or longer than this are rejected before any model call.
+MAX_EMAIL_CHARS = 20_000
+
+# Provider stop reasons that mean the response was cut off by MAX_TOKENS.
+_TRUNCATED_STOP_REASONS = {"max_tokens", "length"}
+
+StopReason = Literal["valid_schema", "max_attempts_reached", "provider_error", "invalid_input"]
 
 
 # --------------------------------------------------------------------------------------
@@ -56,6 +62,7 @@ class Config:
     temperature: float
     effort: str
     deepseek_base_url: str
+    request_timeout_s: float = 60.0
 
     @property
     def provider(self) -> Literal["deepseek", "anthropic"]:
@@ -75,6 +82,7 @@ class Config:
             temperature=float(os.getenv("TEMPERATURE", "0.0")),
             effort=os.getenv("EFFORT", "low").strip(),
             deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip(),
+            request_timeout_s=float(os.getenv("REQUEST_TIMEOUT_S", "60")),
         )
 
     def as_log_dict(self) -> dict[str, Any]:
@@ -85,6 +93,7 @@ class Config:
             "temperature": self.temperature,
             "temperature_sent": self.temperature_sent,
             "effort": self.effort if self.provider == "anthropic" else None,
+            "request_timeout_s": self.request_timeout_s,
         }
 
 
@@ -235,6 +244,8 @@ class ModelResponse:
     request_id: str | None
     # Provider-native assistant turn to append before a retry message.
     assistant_message: dict[str, Any]
+    # Model that actually produced the response (differs from MODEL_NAME after a Claude fallback).
+    served_model: str | None = None
 
 
 class ProviderError(RuntimeError):
@@ -263,12 +274,13 @@ def _require_env(name: str) -> str:
 
 
 def make_deepseek_caller(cfg: Config) -> CallModel:
-    from openai import OpenAI  # lazy: only needed on the DeepSeek path
+    import openai  # lazy: only needed on the DeepSeek path
 
-    client = OpenAI(
+    client = openai.OpenAI(
         api_key=_require_env("DEEPSEEK_API_KEY"),
         base_url=cfg.deepseek_base_url,
         max_retries=0,  # every HTTP request counts toward MAX_MODEL_CALLS
+        timeout=cfg.request_timeout_s,
     )
 
     def call(system: str, messages: list[dict[str, Any]]) -> ModelResponse:
@@ -283,20 +295,23 @@ def make_deepseek_caller(cfg: Config) -> CallModel:
                 extra_body={"thinking": {"type": "disabled"}},  # temperature has no effect in thinking mode
                 stream=False,
             )
-        except Exception as exc:  # openai.APIError and transport errors
+        except openai.APIError as exc:  # status, connection and timeout errors; bugs still raise
             raise ProviderError(f"{type(exc).__name__}: {exc}") from exc
         latency_ms = round((time.perf_counter() - start) * 1000)
+        if not resp.choices:
+            raise ProviderError(f"DeepSeek returned no choices (id={getattr(resp, 'id', None)})")
         choice = resp.choices[0]
         text = choice.message.content or ""
-        usage = resp.usage
+        usage = resp.usage  # Optional in the SDK types
         return ModelResponse(
             text=text,
-            input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-            output_tokens=getattr(usage, "completion_tokens", 0) or 0,
+            input_tokens=(usage.prompt_tokens or 0) if usage is not None else 0,
+            output_tokens=(usage.completion_tokens or 0) if usage is not None else 0,
             latency_ms=latency_ms,
             api_stop_reason=choice.finish_reason,
             request_id=getattr(resp, "id", None),
             assistant_message={"role": "assistant", "content": text},
+            served_model=getattr(resp, "model", None),
         )
 
     return call
@@ -306,7 +321,10 @@ def make_anthropic_caller(cfg: Config) -> CallModel:
     import anthropic  # lazy: only needed on the Claude path
 
     _require_env("ANTHROPIC_API_KEY")
-    client = anthropic.Anthropic(max_retries=0)  # every HTTP request counts toward MAX_MODEL_CALLS
+    client = anthropic.Anthropic(
+        max_retries=0,  # every HTTP request counts toward MAX_MODEL_CALLS
+        timeout=cfg.request_timeout_s,
+    )
     use_fallback = cfg.model_name in _ANTHROPIC_FALLBACK_MODELS
 
     def call(system: str, messages: list[dict[str, Any]]) -> ModelResponse:
@@ -332,6 +350,9 @@ def make_anthropic_caller(cfg: Config) -> CallModel:
             details = getattr(resp, "stop_details", None)
             category = getattr(details, "category", None) if details else None
             raise ProviderError(f"Model refused the request (category={category}, request_id={request_id})")
+        served_model = getattr(resp, "model", None)
+        if any(block.type == "fallback" for block in resp.content):
+            log.warning("refusal fallback: %s declined, served by %s (request_id=%s)", cfg.model_name, served_model, request_id)
         text = "".join(block.text for block in resp.content if block.type == "text")
         return ModelResponse(
             text=text,
@@ -342,6 +363,7 @@ def make_anthropic_caller(cfg: Config) -> CallModel:
             request_id=request_id,
             # Echo the full content (incl. thinking blocks) unchanged on retry.
             assistant_message={"role": "assistant", "content": [b.to_dict() for b in resp.content]},
+            served_model=served_model,
         )
 
     return call
@@ -365,6 +387,7 @@ class Attempt:
     latency_ms: int = 0
     api_stop_reason: str | None = None
     request_id: str | None = None
+    served_model: str | None = None
     raw_response: str | None = None
     validation_error: str | None = None
     provider_error: str | None = None
@@ -377,6 +400,7 @@ class IntakeTrace:
     attempts: list[Attempt] = field(default_factory=list)
     prompt_file: str = ""
     prompt_sha256: str = ""
+    input_error: str | None = None
 
     @property
     def outcome(self) -> Literal["valid", "failed"]:
@@ -396,7 +420,8 @@ class IntakeTrace:
 
     @property
     def errors(self) -> list[str]:
-        return [e for a in self.attempts for e in (a.validation_error, a.provider_error) if e]
+        errs = [self.input_error] if self.input_error else []
+        return errs + [e for a in self.attempts for e in (a.validation_error, a.provider_error) if e]
 
 
 class IntakeFailed(RuntimeError):
@@ -406,21 +431,53 @@ class IntakeFailed(RuntimeError):
         super().__init__(f"Intake failed ({trace.stop_reason}) after {len(trace.attempts)} call(s): {last}")
 
 
+def check_email(email: str) -> str | None:
+    """Return a reason the email must not be sent to the model, or None if it is acceptable."""
+    if not isinstance(email, str) or not email.strip():
+        return "Email is empty."
+    if len(email) > MAX_EMAIL_CHARS:
+        return f"Email is {len(email)} characters; the limit is {MAX_EMAIL_CHARS}."
+    return None
+
+
+def _truncation_hint(resp: ModelResponse, max_tokens: int | None) -> str:
+    if resp.api_stop_reason not in _TRUNCATED_STOP_REASONS:
+        return ""
+    limit = f" ({max_tokens})" if max_tokens else ""
+    return f"Response was cut off at the MAX_TOKENS limit{limit}; return only the compact JSON object.\n"
+
+
 def run_with_trace(
     email: str,
     call_model: CallModel | None = None,
     prompt: Prompt | None = None,
+    max_tokens: int | None = None,
 ) -> IntakeTrace:
-    """Run the bounded validate-and-retry loop and return the full trace."""
-    prompt = prompt or load_prompt()
-    if call_model is None:
-        call_model = make_caller(Config.from_env())
+    """Run the bounded validate-and-retry loop and return the full trace.
 
+    ``max_tokens`` is only used to word the truncation hint; defaults to the env config.
+    """
+    prompt = prompt or load_prompt()
     try:
         prompt_file = str(prompt.path.relative_to(ROOT))
     except ValueError:
         prompt_file = str(prompt.path)
     trace = IntakeTrace(intake=None, stop_reason="max_attempts_reached", prompt_file=prompt_file, prompt_sha256=prompt.sha256)
+
+    # Input guard: reject before building a client or spending a model call.
+    input_error = check_email(email)
+    if input_error:
+        log.error("rejected input: %s", input_error)
+        trace.input_error = input_error
+        trace.stop_reason = "invalid_input"
+        return trace
+
+    if call_model is None or max_tokens is None:
+        cfg = Config.from_env()
+        max_tokens = max_tokens if max_tokens is not None else cfg.max_tokens
+        if call_model is None:
+            call_model = make_caller(cfg)
+
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt.user(email)}]
 
     for n in range(1, MAX_MODEL_CALLS + 1):
@@ -440,17 +497,19 @@ def run_with_trace(
             latency_ms=resp.latency_ms,
             api_stop_reason=resp.api_stop_reason,
             request_id=resp.request_id,
+            served_model=resp.served_model,
         )
         trace.attempts.append(attempt)
         try:
             trace.intake = validate_intake(resp.text)
         except IntakeValidationError as exc:
+            error = _truncation_hint(resp, max_tokens) + str(exc)
             attempt.raw_response = resp.text
-            attempt.validation_error = str(exc)
-            log.warning("attempt %d/%d failed validation: %s", n, MAX_MODEL_CALLS, exc)
+            attempt.validation_error = error
+            log.warning("attempt %d/%d failed validation: %s", n, MAX_MODEL_CALLS, error)
             if n < MAX_MODEL_CALLS:
                 messages.append(resp.assistant_message)
-                messages.append({"role": "user", "content": prompt.retry(str(exc))})
+                messages.append({"role": "user", "content": prompt.retry(error)})
             continue
 
         attempt.valid = True
