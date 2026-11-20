@@ -7,7 +7,7 @@ Turns raw customer support emails into schema-validated `Intake` objects with dr
 Requires Python 3.10+. Dependencies are pinned to exact versions in `requirements.txt` (`anthropic==2.12.0`, `openai==3.57.0`, `pydantic==2.13.4`, `python-dotenv==1.2.4`).
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env

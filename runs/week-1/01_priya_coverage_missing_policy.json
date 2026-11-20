@@ -1,0 +1,9 @@
+{
+  "category": "coverage",
+  "missing_fields": [
+    "policy_number"
+  ],
+  "next_action": "ask",
+  "customer_message": "Thank you for reaching out to Harbourline about seeing a dermatologist for your rash. So we can look into your question, could you please reply with your policy number?",
+  "confidence": 0.95
+}
