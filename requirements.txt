@@ -3,3 +3,5 @@ anthropic==2.12.0
 openai==3.57.0
 pydantic==2.13.4
 python-dotenv==1.2.4
+# Week 2: Pinecone vector index + Pinecone Inference (multilingual-e5-large embeddings, bge-reranker-v2-m3).
+pinecone==10.3.0

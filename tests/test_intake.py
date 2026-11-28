@@ -362,8 +362,10 @@ class PromptAndConfigTests(unittest.TestCase):
         self.assertIn("ERR", p.retry("ERR"))
         self.assertEqual(len(p.sha256), 64)
 
-    def test_only_one_prompt_file(self):
-        self.assertEqual([f.name for f in (ROOT / "prompts").iterdir()], ["intake_v1.md"])
+    def test_prompt_files(self):
+        # Week 1 intake uses only intake_v1.md; Week 2 adds coverage_v1.md for the RAG stage.
+        self.assertEqual(sorted(f.name for f in (ROOT / "prompts").iterdir()), ["coverage_v1.md", "intake_v1.md"])
+        self.assertEqual(load_prompt().path.name, "intake_v1.md")
 
     def test_provider_inference(self):
         self.assertEqual(provider_for("deepseek-flash"), "deepseek")

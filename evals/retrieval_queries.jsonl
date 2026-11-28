@@ -1,0 +1,10 @@
+{"id": "q01", "query": "Is a dermatologist covered?", "expected_ids": ["4.2a"], "forbidden_ids": ["4.2"], "note": "acceptance query; superseded 4.2 must not surface"}
+{"id": "q02", "query": "Can I see a skin doctor about a rash that won't go away?", "expected_ids": ["4.2a"], "forbidden_ids": ["4.2"], "note": "paraphrase: no shared vocabulary with 'dermatology'"}
+{"id": "q03", "query": "¿Mi plan incluye la consulta con un especialista como un cardiólogo?", "expected_ids": ["4.2a"], "forbidden_ids": ["4.2"], "note": "Spanish query against an English handbook"}
+{"id": "q04", "query": "How many physiotherapy sessions per year does my plan cover?", "expected_ids": ["6.1", "9.3"], "forbidden_ids": [], "note": "conflicting active pair: both must be retrieved"}
+{"id": "q05", "query": "Am I covered for emergency medical treatment overseas on a three-week trip?", "expected_ids": ["7.4a"], "forbidden_ids": ["7.4"], "note": "superseded trap: 7.4 matches the wording, 7.4a is the current rule"}
+{"id": "q06", "query": "What was the old specialist visit rule before 2026?", "expected_ids": ["4.2"], "forbidden_ids": [], "note": "explicit historical request: superseded clause allowed"}
+{"id": "q07", "query": "How much do I have to pay myself when I'm admitted to hospital?", "expected_ids": ["3.2"], "forbidden_ids": [], "note": "paraphrase of 'excess'"}
+{"id": "q08", "query": "How long after my appointment can I still send in a receipt to get money back?", "expected_ids": ["8.1"], "forbidden_ids": [], "note": "paraphrase of claim submission deadline"}
+{"id": "q09", "query": "Are video calls with my GP covered?", "expected_ids": ["4.3"], "forbidden_ids": [], "note": "telehealth"}
+{"id": "q10", "query": "Is seeing a therapist for anxiety covered?", "expected_ids": ["9.4"], "forbidden_ids": [], "note": "paraphrase: therapist/anxiety vs psychologist/counsellor"}
