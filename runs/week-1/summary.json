@@ -1,0 +1,29 @@
+{
+  "run_id": "2026-11-20T17:35:34Z",
+  "provider": "deepseek",
+  "model": "deepseek-flash",
+  "max_tokens": 2048,
+  "temperature": 0.0,
+  "temperature_sent": true,
+  "effort": null,
+  "request_timeout_s": 60.0,
+  "max_attempts": 3,
+  "prompt_file": "prompts/intake_v1.md",
+  "prompt_sha256": "8d1ef20d887546c0c1cdcb55878beec8add68b575900f5ef394be6618801cf66",
+  "emails": 5,
+  "valid": 5,
+  "failed": 0,
+  "total_model_calls": 5,
+  "total_input_tokens": 5289,
+  "total_output_tokens": 444,
+  "total_latency_ms": 5495,
+  "stop_reasons": {
+    "01_priya_coverage_missing_policy.txt": "valid_schema",
+    "02_billing_with_policy.txt": "valid_schema",
+    "03_claim_status.txt": "valid_schema",
+    "04_thank_you.txt": "valid_schema",
+    "05_bilingual_specialist.txt": "valid_schema"
+  },
+  "run_log_file": "run_log.jsonl",
+  "tokens_file": "tokens.jsonl"
+}
